@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-telegram-bot
+asyncpg
+python-dotenv
+httpx
+pydantic
