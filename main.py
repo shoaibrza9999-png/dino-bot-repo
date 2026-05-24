@@ -37,10 +37,16 @@ async def lifespan(app: FastAPI):
                 user_id BIGINT PRIMARY KEY,
                 username VARCHAR(255),
                 first_name VARCHAR(255),
-                best_score INT DEFAULT 0
+                best_score INT DEFAULT 0,
+                coins INT DEFAULT 0
             )
         ''')
-    
+        # In case the table exists without coins
+        try:
+            await conn.execute('ALTER TABLE scores ADD COLUMN coins INT DEFAULT 0')
+        except asyncpg.exceptions.DuplicateColumnError:
+            pass
+            
     # Init Telegram Bot
     global tg_app
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -72,15 +78,25 @@ app.add_middleware(
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # Pass chat_id dynamically so the game knows where to send the score
+    app_url = f"{FRONTEND_URL}?chat_id={chat_id}"
+    
     keyboard = [
-        [InlineKeyboardButton("Play Dino", web_app=WebAppInfo(url=FRONTEND_URL))]
+        [InlineKeyboardButton("Play Dino", web_app=WebAppInfo(url=app_url))]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Click the button below to play the Dino game!", reply_markup=reply_markup)
+    
+    if update.effective_chat.type in ['group', 'supergroup']:
+        msg = "Click the button below to play the Dino game in this group!"
+    else:
+        msg = "Click the button below to play the Dino game!"
+        
+    await update.message.reply_text(msg, reply_markup=reply_markup)
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with app_state["pool"].acquire() as conn:
-        records = await conn.fetch("SELECT first_name, best_score FROM scores ORDER BY best_score DESC LIMIT 10")
+        records = await conn.fetch("SELECT first_name, best_score, coins FROM scores ORDER BY best_score DESC LIMIT 10")
     
     if not records:
         await update.message.reply_text("No scores yet. Be the first to play!")
@@ -89,7 +105,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "🏆 *Dino Leaderboard* 🏆\n\n"
     for i, r in enumerate(records, 1):
         name = r['first_name'] or "Anonymous"
-        msg += f"{i}. {name} - {r['best_score']} pts\n"
+        coins = r['coins'] or 0
+        msg += f"{i}. {name} - {r['best_score']} pts | 🪙 {coins} coins\n"
         
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -103,6 +120,7 @@ async def telegram_webhook(request: Request):
 class ScorePayload(BaseModel):
     initData: str
     score: int
+    chat_id: str = None
 
 def validate_telegram_data(init_data: str, token: str) -> dict:
     parsed_data = dict(parse_qsl(init_data))
@@ -118,12 +136,17 @@ def validate_telegram_data(init_data: str, token: str) -> dict:
         return json.loads(parsed_data.get('user', '{}'))
     return None
 
-async def notify_score(user_id: int, score: int, is_new_best: bool):
-    msg = f"Game Over! You scored {score} points."
+async def notify_score(user_id: int, chat_id: int, first_name: str, score: int, coins_earned: int, is_new_best: bool):
+    msg = f"🎮 {first_name} scored {score} points!"
+    if coins_earned > 0:
+        msg += f"\n🪙 Earned {coins_earned} coins."
     if is_new_best:
         msg += "\n🎉 New High Score!"
+        
+    # Send to the group where the game was started, or the user's private chat
+    target_chat = chat_id if chat_id else user_id
     try:
-        await tg_app.bot.send_message(chat_id=user_id, text=msg)
+        await tg_app.bot.send_message(chat_id=target_chat, text=msg)
     except Exception as e:
         print(f"Failed to send message: {e}")
 
@@ -133,31 +156,43 @@ async def submit_score(payload: ScorePayload, background_tasks: BackgroundTasks)
     if not user_data:
         raise HTTPException(status_code=401, detail="Invalid initData")
         
+    # The user who is ACTUALLY playing the game right now
     user_id = user_data.get('id')
     username = user_data.get('username')
     first_name = user_data.get('first_name')
     score = payload.score
     
+    coins_earned = score // 100
     is_new_best = False
     
     async with app_state["pool"].acquire() as conn:
         record = await conn.fetchrow("SELECT best_score FROM scores WHERE user_id = $1", user_id)
         if not record:
             await conn.execute(
-                "INSERT INTO scores (user_id, username, first_name, best_score) VALUES ($1, $2, $3, $4)",
-                user_id, username, first_name, score
+                "INSERT INTO scores (user_id, username, first_name, best_score, coins) VALUES ($1, $2, $3, $4, $5)",
+                user_id, username, first_name, score, coins_earned
             )
             is_new_best = True
-        elif score > record['best_score']:
+        else:
             await conn.execute(
-                "UPDATE scores SET best_score = $1, username = $2, first_name = $3 WHERE user_id = $4",
-                score, username, first_name, user_id
+                "UPDATE scores SET coins = coins + $1 WHERE user_id = $2",
+                coins_earned, user_id
             )
-            is_new_best = True
+            if score > record['best_score']:
+                await conn.execute(
+                    "UPDATE scores SET best_score = $1, username = $2, first_name = $3 WHERE user_id = $4",
+                    score, username, first_name, user_id
+                )
+                is_new_best = True
 
-    background_tasks.add_task(notify_score, user_id, score, is_new_best)
+    try:
+        chat_id = int(payload.chat_id) if payload.chat_id else None
+    except:
+        chat_id = None
+
+    background_tasks.add_task(notify_score, user_id, chat_id, first_name, score, coins_earned, is_new_best)
     
-    return {"status": "success", "is_new_best": is_new_best}
+    return {"status": "success", "is_new_best": is_new_best, "coins_earned": coins_earned}
 
 @app.get("/")
 def health_check():
