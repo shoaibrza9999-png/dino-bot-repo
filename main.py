@@ -78,21 +78,39 @@ app.add_middleware(
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_type = update.effective_chat.type
     chat_id = update.effective_chat.id
-    # Pass chat_id dynamically so the game knows where to send the score
-    app_url = f"{FRONTEND_URL}?chat_id={chat_id}"
-    
-    keyboard = [
-        [InlineKeyboardButton("Play Dino", web_app=WebAppInfo(url=app_url))]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.effective_chat.type in ['group', 'supergroup']:
-        msg = "Click the button below to play the Dino game in this group!"
-    else:
-        msg = "Click the button below to play the Dino game!"
+    bot_username = tg_app.bot.username
+
+    if chat_type in ['group', 'supergroup']:
+        # In groups, WebApp buttons don't work reliably. Use a deep link to the bot.
+        # Format: https://t.me/bot_username?start=chat_id
+        # Note: negative sign in chat_id needs to be handled properly if passed via start payload
+        payload_chat_id = str(chat_id).replace('-', 'm')
+        deep_link = f"https://t.me/{bot_username}?start={payload_chat_id}"
         
-    await update.message.reply_text(msg, reply_markup=reply_markup)
+        keyboard = [
+            [InlineKeyboardButton("Play Dino", url=deep_link)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Click below to play the Dino game in this group!", reply_markup=reply_markup)
+    else:
+        # Private chat
+        # Check if it was opened from a group deep link
+        target_chat_id = chat_id
+        if context.args and len(context.args) > 0:
+            raw_payload = context.args[0]
+            if raw_payload.startswith('m'):
+                target_chat_id = '-' + raw_payload[1:]
+            else:
+                target_chat_id = raw_payload
+                
+        app_url = f"{FRONTEND_URL}?chat_id={target_chat_id}"
+        keyboard = [
+            [InlineKeyboardButton("Play Dino", web_app=WebAppInfo(url=app_url))]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Click the button below to start the game!", reply_markup=reply_markup)
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with app_state["pool"].acquire() as conn:
