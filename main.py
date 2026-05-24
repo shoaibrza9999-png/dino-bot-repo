@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -41,7 +41,6 @@ async def lifespan(app: FastAPI):
                 coins INT DEFAULT 0
             )
         ''')
-        # In case the table exists without coins
         try:
             await conn.execute('ALTER TABLE scores ADD COLUMN coins INT DEFAULT 0')
         except asyncpg.exceptions.DuplicateColumnError:
@@ -53,7 +52,8 @@ async def lifespan(app: FastAPI):
     
     # Handlers
     tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("leaderboard", leaderboard))
+    tg_app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    tg_app.add_handler(CallbackQueryHandler(leaderboard_callback, pattern="^lb_"))
     
     await tg_app.initialize()
     if WEBHOOK_URL:
@@ -71,7 +71,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production if needed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,12 +82,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bot_username = tg_app.bot.username
 
-    # Direct Mini App Link configuration
-    # Encode negative sign for startapp parameter which only allows alphanumeric and underscores
     payload_chat_id = str(chat_id).replace('-', 'm')
     app_short_name = "Dinnnnno"
     
-    # This URL opens the mini app directly over any chat.
     deep_link = f"https://t.me/{bot_username}/{app_short_name}?startapp={payload_chat_id}"
 
     keyboard = [
@@ -98,24 +95,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ['group', 'supergroup']:
         await update.message.reply_text("Click below to play the Dino game right here in the group!", reply_markup=reply_markup)
     else:
-        # Private chat
         await update.message.reply_text("Click the button below to start the game!", reply_markup=reply_markup)
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def get_leaderboard_text(lb_type="score"):
     async with app_state["pool"].acquire() as conn:
-        records = await conn.fetch("SELECT first_name, best_score, coins FROM scores ORDER BY best_score DESC LIMIT 10")
-    
+        if lb_type == "coins":
+            records = await conn.fetch("SELECT first_name, best_score, coins FROM scores ORDER BY coins DESC, best_score DESC LIMIT 10")
+            title = "🏆 *Dino Leaderboard (Coins)* 🏆\n\n"
+        else:
+            records = await conn.fetch("SELECT first_name, best_score, coins FROM scores ORDER BY best_score DESC LIMIT 10")
+            title = "🏆 *Dino Leaderboard (Score)* 🏆\n\n"
+            
     if not records:
-        await update.message.reply_text("No scores yet. Be the first to play!")
-        return
+        return "No scores yet. Be the first to play!"
         
-    msg = "🏆 *Dino Leaderboard* 🏆\n\n"
+    msg = title
     for i, r in enumerate(records, 1):
         name = r['first_name'] or "Anonymous"
         coins = r['coins'] or 0
-        msg += f"{i}. {name} - {r['best_score']} pts | 🪙 {coins} coins\n"
-        
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        if lb_type == "coins":
+            msg += f"{i}. {name} - 🪙 {coins} coins | {r['best_score']} pts\n"
+        else:
+            msg += f"{i}. {name} - {r['best_score']} pts | 🪙 {coins} coins\n"
+            
+    return msg
+
+def get_leaderboard_markup():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Score", callback_data="lb_score"),
+            InlineKeyboardButton("🪙 Coins", callback_data="lb_coins")
+        ]
+    ])
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await get_leaderboard_text("score")
+    if msg.startswith("No scores"):
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_leaderboard_markup())
+
+async def leaderboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    lb_type = query.data.split("_")[1]
+    msg = await get_leaderboard_text(lb_type)
+    
+    try:
+        await query.edit_message_text(text=msg, parse_mode="Markdown", reply_markup=get_leaderboard_markup())
+    except Exception as e:
+        pass # Message is not modified
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -150,7 +180,6 @@ async def notify_score(user_id: int, chat_id: int, first_name: str, score: int, 
     if is_new_best:
         msg += "\n🎉 New High Score!"
         
-    # Send to the group where the game was started, or the user's private chat
     target_chat = chat_id if chat_id else user_id
     try:
         await tg_app.bot.send_message(chat_id=target_chat, text=msg)
@@ -163,7 +192,6 @@ async def submit_score(payload: ScorePayload, background_tasks: BackgroundTasks)
     if not user_data:
         raise HTTPException(status_code=401, detail="Invalid initData")
         
-    # The user who is ACTUALLY playing the game right now
     user_id = user_data.get('id')
     username = user_data.get('username')
     first_name = user_data.get('first_name')
